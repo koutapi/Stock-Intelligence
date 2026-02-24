@@ -644,29 +644,42 @@ export default function App() {
   const handleSearch = useCallback(async () => {
     if (!searchQuery.trim()) return;
     setSearchError("");
-    const q = searchQuery.trim().toLowerCase();
-    const upperQ = searchQuery.trim().toUpperCase();
+    setSearchLoading(true);
+    const q = searchQuery.trim();
+    const qLower = q.toLowerCase();
 
-    // 1. ローカルデータで完全一致チェック
+    // Yahoo Finance APIでリアルタイムデータ取得を試みる
+    const result = await fetchYahooStock(q);
+    if (result && result.price > 0) {
+      // ローカルにある銘柄ならニュース・決算を保持しつつ株価を更新
+      const local = allStocks.find(s => s.code.toLowerCase() === result.code.toLowerCase());
+      if (local) {
+        setAllStocks(prev => prev.map(s =>
+          s.code.toLowerCase() === result.code.toLowerCase()
+            ? { ...result, news: s.news || [], earnings: s.earnings || null, sector: result.sector || s.sector }
+            : s
+        ));
+        setFavorites(prev => new Set(prev).add(local.code));
+      } else {
+        setAllStocks(prev => [...prev, result]);
+        setFavorites(prev => new Set(prev).add(result.code));
+      }
+      setSearchQuery("");
+      setSearchLoading(false);
+      return;
+    }
+
+    // APIが失敗した場合、ローカルデータで探す（フォールバック）
     const local = allStocks.find(s =>
-      s.code.toLowerCase() === q || s.name.toLowerCase().includes(q)
+      s.code.toLowerCase() === qLower ||
+      s.name.toLowerCase().includes(qLower) ||
+      s.sector.toLowerCase().includes(qLower)
     );
     if (local) {
       setFavorites(prev => new Set(prev).add(local.code));
       setSearchQuery("");
-      return;
-    }
-
-    // 2. Yahoo Finance APIで取得
-    setSearchLoading(true);
-    const result = await fetchYahooStock(searchQuery.trim());
-    if (result && result.price > 0) {
-      const exists = allStocks.find(s => s.code === result.code);
-      if (!exists) setAllStocks(prev => [...prev, result]);
-      setFavorites(prev => new Set(prev).add(result.code));
-      setSearchQuery("");
     } else {
-      setSearchError(`「${searchQuery.trim()}」のデータを取得できませんでした。ティッカー（例: AAPL）または証券コード（例: 7203）を確認してください。`);
+      setSearchError(`「${q}」のデータを取得できませんでした。ティッカー（例: AAPL）または証券コード（例: 7203）を確認してください。`);
     }
     setSearchLoading(false);
   }, [searchQuery, allStocks]);
@@ -743,8 +756,28 @@ export default function App() {
           </button>
 
           {favListOpen && (
-            <div style={{ padding: 12, borderRadius: 12, background: "rgba(22,30,52,0.6)", border: "1px solid rgba(148,163,184,0.08)", marginBottom: 12, maxHeight: 240, overflowY: "auto" }}>
-              <div style={{ fontSize: 10, color: "#475569", marginBottom: 8 }}>タップで登録 / 解除</div>
+            <div style={{ padding: 12, borderRadius: 12, background: "rgba(22,30,52,0.6)", border: "1px solid rgba(148,163,184,0.08)", marginBottom: 12, maxHeight: 280, overflowY: "auto" }}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
+                <span style={{ fontSize: 10, color: "#475569" }}>タップで登録 / 解除</span>
+                <button onClick={async () => {
+                  setSearchLoading(true);
+                  for (const stock of favStocks) {
+                    const result = await fetchYahooStock(stock.code);
+                    if (result && result.price > 0) {
+                      setAllStocks(prev => prev.map(s =>
+                        s.code === stock.code
+                          ? { ...result, news: s.news || [], earnings: s.earnings || null, sector: result.sector || s.sector }
+                          : s
+                      ));
+                    }
+                  }
+                  setSearchLoading(false);
+                }} disabled={searchLoading} style={{
+                  padding: "4px 10px", borderRadius: 6, border: "1px solid rgba(56,189,248,0.3)",
+                  background: searchLoading ? "rgba(56,189,248,0.1)" : "rgba(56,189,248,0.15)",
+                  color: "#38bdf8", fontSize: 10, fontWeight: 700, cursor: searchLoading ? "wait" : "pointer",
+                }}>{searchLoading ? "更新中..." : "🔄 全銘柄を最新データに更新"}</button>
+              </div>
               <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
                 {allStocks.map(stock => {
                   const isFav = favorites.has(stock.code);
