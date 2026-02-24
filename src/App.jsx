@@ -1,7 +1,139 @@
-import { useState, useMemo } from "react";
+import { useState, useMemo, useCallback } from "react";
 
 // ============================================
-// 登録済みサンプル銘柄データ
+// Yahoo Finance API（Vercel経由）
+// ============================================
+function toYahooSymbol(code) {
+  if (/^\d{4}$/.test(code)) return `${code}.T`;
+  return code.toUpperCase();
+}
+
+async function fetchYahooStock(code) {
+  const symbol = toYahooSymbol(code);
+  try {
+    // チャートデータ取得（6ヶ月分）
+    const chartRes = await fetch(`/api/yahoo?symbol=${encodeURIComponent(symbol)}`);
+    if (!chartRes.ok) return null;
+    const chartData = await chartRes.json();
+    if (!chartData.chart?.result?.[0]) return null;
+
+    const result = chartData.chart.result[0];
+    const meta = result.meta;
+    const quotes = result.indicators.quote[0];
+    const closes = quotes.close.filter(c => c != null);
+    const volumes = quotes.volume.filter(v => v != null);
+    if (closes.length < 2) return null;
+
+    const price = meta.regularMarketPrice || closes[closes.length - 1];
+    const prevClose = meta.previousClose || meta.chartPreviousClose || closes[closes.length - 2];
+    const change = prevClose ? ((price - prevClose) / prevClose * 100) : 0;
+
+    // 移動平均計算
+    const calcMA = (arr, period) => {
+      if (arr.length < period) return price;
+      return arr.slice(-period).reduce((a, b) => a + b, 0) / period;
+    };
+    const ma5 = calcMA(closes, 5);
+    const ma25 = calcMA(closes, 25);
+    const ma50 = calcMA(closes, 50);
+    const ma75 = calcMA(closes, 75);
+    const ma200 = closes.length >= 200 ? calcMA(closes, 200) : calcMA(closes, closes.length);
+
+    // RSI計算（14日）
+    const calcRSI = (arr, period = 14) => {
+      if (arr.length < period + 1) return 50;
+      const changes = [];
+      for (let i = arr.length - period - 1; i < arr.length - 1; i++) {
+        changes.push(arr[i + 1] - arr[i]);
+      }
+      const gains = changes.filter(c => c > 0);
+      const losses = changes.filter(c => c < 0).map(c => Math.abs(c));
+      const avgGain = gains.length > 0 ? gains.reduce((a, b) => a + b, 0) / period : 0;
+      const avgLoss = losses.length > 0 ? losses.reduce((a, b) => a + b, 0) / period : 0;
+      if (avgLoss === 0) return 100;
+      return Math.round(100 - (100 / (1 + avgGain / avgLoss)));
+    };
+
+    // MACD計算
+    const calcEMA = (arr, period) => {
+      const k = 2 / (period + 1);
+      let ema = arr[0];
+      for (let i = 1; i < arr.length; i++) ema = arr[i] * k + ema * (1 - k);
+      return ema;
+    };
+    const ema12 = calcEMA(closes.slice(-30), 12);
+    const ema26 = calcEMA(closes.slice(-30), 26);
+    const macdVal = ema12 - ema26;
+
+    // Stochastic
+    const last14 = closes.slice(-14);
+    const high14 = Math.max(...last14);
+    const low14 = Math.min(...last14);
+    const stochK = high14 !== low14 ? Math.round((price - low14) / (high14 - low14) * 100) : 50;
+
+    const volume = volumes[volumes.length - 1] || 0;
+    const avgVolume = volumes.length >= 20
+      ? Math.round(volumes.slice(-20).reduce((a, b) => a + b, 0) / 20) : volume;
+
+    const name = meta.shortName || meta.longName || meta.symbol || code;
+    const market = /^\d{4}$/.test(code) ? "JP" : "US";
+    const currency = market === "JP" ? "¥" : "$";
+
+    const stockData = {
+      code: code.toUpperCase(),
+      name,
+      market,
+      sector: "",
+      price: Math.round(price * 100) / 100,
+      change: Math.round(change * 100) / 100,
+      currency,
+      technical: {
+        rsi: calcRSI(closes), macd: Math.round(macdVal * 100) / 100,
+        macdSignal: macdVal > 0.5 ? "bullish" : macdVal < -0.5 ? "bearish" : "neutral",
+        ma5: Math.round(ma5 * 100) / 100, ma25: Math.round(ma25 * 100) / 100,
+        ma50: Math.round(ma50 * 100) / 100, ma75: Math.round(ma75 * 100) / 100,
+        ma200: Math.round(ma200 * 100) / 100,
+        volume, avgVolume, stochK, stochD: Math.max(stochK - 5, 10),
+      },
+      fundamental: { per: 0, pbr: 0, roe: 0, divYield: 0, epsGrowth: 0, revenueGrowth: 0, marketCap: "" },
+      earnings: null,
+      news: [],
+    };
+
+    // ファンダメンタルデータも取得
+    try {
+      const fundRes = await fetch(`/api/yahoo?symbol=${encodeURIComponent(symbol)}&modules=defaultKeyStatistics,financialData,summaryDetail,assetProfile`);
+      if (fundRes.ok) {
+        const fundData = await fundRes.json();
+        const r = fundData.quoteSummary?.result?.[0];
+        if (r) {
+          const ks = r.defaultKeyStatistics || {};
+          const fd = r.financialData || {};
+          const sd = r.summaryDetail || {};
+          const ap = r.assetProfile || {};
+          stockData.sector = ap.sector || ap.industry || "";
+          stockData.fundamental = {
+            per: sd.trailingPE?.raw || sd.forwardPE?.raw || 0,
+            pbr: ks.priceToBook?.raw || 0,
+            roe: fd.returnOnEquity?.raw ? Math.round(fd.returnOnEquity.raw * 10000) / 100 : 0,
+            divYield: sd.dividendYield?.raw ? Math.round(sd.dividendYield.raw * 10000) / 100 : 0,
+            epsGrowth: ks.earningsQuarterlyGrowth?.raw ? Math.round(ks.earningsQuarterlyGrowth.raw * 10000) / 100 : 0,
+            revenueGrowth: fd.revenueGrowth?.raw ? Math.round(fd.revenueGrowth.raw * 10000) / 100 : 0,
+            marketCap: fd.marketCap?.fmt || sd.marketCap?.fmt || "",
+          };
+        }
+      }
+    } catch (e) { /* ファンダメンタルは取れなくてもOK */ }
+
+    return stockData;
+  } catch (err) {
+    console.error("Yahoo Finance error:", err);
+    return null;
+  }
+}
+
+// ============================================
+// 登録済みサンプル銘柄データ（フォールバック用）
 // ============================================
 const BUILTIN_STOCKS = [
   { code: "7203", name: "トヨタ自動車", market: "JP", sector: "輸送用機器", price: 2847, change: +1.2, currency: "¥",
@@ -497,6 +629,7 @@ export default function App() {
   const [expandedCards, setExpandedCards] = useState(new Set());
   const [allStocks, setAllStocks] = useState(BUILTIN_STOCKS);
   const [searchQuery, setSearchQuery] = useState("");
+  const [searchLoading, setSearchLoading] = useState(false);
   const [searchError, setSearchError] = useState("");
   const [favListOpen, setFavListOpen] = useState(false);
   const [marketExpanded, setMarketExpanded] = useState(new Set(["nikkei"]));
@@ -508,24 +641,35 @@ export default function App() {
   const favStocks = useMemo(() => allStocks.filter(s => favorites.has(s.code)), [allStocks, favorites]);
   const analyses = useMemo(() => { const m = {}; favStocks.forEach(s => { m[s.code] = analyzeStock(s); }); return m; }, [favStocks]);
 
-  const handleSearch = () => {
+  const handleSearch = useCallback(async () => {
     if (!searchQuery.trim()) return;
     setSearchError("");
     const q = searchQuery.trim().toLowerCase();
-    // コード完全一致 → 名前部分一致 → セクター部分一致
-    const match = allStocks.find(s =>
-      s.code.toLowerCase() === q ||
-      s.name.toLowerCase().includes(q) ||
-      s.sector.toLowerCase().includes(q)
+    const upperQ = searchQuery.trim().toUpperCase();
+
+    // 1. ローカルデータで完全一致チェック
+    const local = allStocks.find(s =>
+      s.code.toLowerCase() === q || s.name.toLowerCase().includes(q)
     );
-    if (match) {
-      setFavorites(prev => new Set(prev).add(match.code));
+    if (local) {
+      setFavorites(prev => new Set(prev).add(local.code));
+      setSearchQuery("");
+      return;
+    }
+
+    // 2. Yahoo Finance APIで取得
+    setSearchLoading(true);
+    const result = await fetchYahooStock(searchQuery.trim());
+    if (result && result.price > 0) {
+      const exists = allStocks.find(s => s.code === result.code);
+      if (!exists) setAllStocks(prev => [...prev, result]);
+      setFavorites(prev => new Set(prev).add(result.code));
       setSearchQuery("");
     } else {
-      const available = allStocks.map(s => s.code).join(", ");
-      setSearchError(`「${searchQuery.trim()}」は登録データにありません。利用可能: ${available}`);
+      setSearchError(`「${searchQuery.trim()}」のデータを取得できませんでした。ティッカー（例: AAPL）または証券コード（例: 7203）を確認してください。`);
     }
-  };
+    setSearchLoading(false);
+  }, [searchQuery, allStocks]);
 
   const tabs = [
     { key: "watch", label: "ウォッチ" },
@@ -572,12 +716,12 @@ export default function App() {
                 }}
               />
             </div>
-            <button onClick={handleSearch} style={{
+            <button onClick={handleSearch} disabled={searchLoading} style={{
               padding: "10px 20px", borderRadius: 10, border: "none",
-              background: "linear-gradient(135deg, #0ea5e9, #38bdf8)",
-              color: "#fff", fontSize: 13, fontWeight: 700, cursor: "pointer",
+              background: searchLoading ? "rgba(56,189,248,0.3)" : "linear-gradient(135deg, #0ea5e9, #38bdf8)",
+              color: "#fff", fontSize: 13, fontWeight: 700, cursor: searchLoading ? "wait" : "pointer",
               flexShrink: 0,
-            }}>{"追加"}</button>
+            }}>{searchLoading ? "取得中..." : "追加"}</button>
           </div>
         )}
         {searchError && <div style={{ marginTop: 6, fontSize: 11, color: "#f87171" }}>{searchError}</div>}
