@@ -100,27 +100,55 @@ async function fetchYahooStock(code) {
       news: [],
     };
 
-    // ファンダメンタルデータも取得
+    // ファンダメンタルデータ取得（複数エンドポイント試行）
     try {
-      const fundRes = await fetch(`/api/yahoo?symbol=${encodeURIComponent(symbol)}&modules=defaultKeyStatistics,financialData,summaryDetail,assetProfile`);
-      if (fundRes.ok) {
-        const fundData = await fundRes.json();
-        const r = fundData.quoteSummary?.result?.[0];
-        if (r) {
-          const ks = r.defaultKeyStatistics || {};
-          const fd = r.financialData || {};
-          const sd = r.summaryDetail || {};
-          const ap = r.assetProfile || {};
-          stockData.sector = ap.sector || ap.industry || "";
+      // まず v6/quote を試す（PER, 時価総額, 配当利回り等）
+      const quoteRes = await fetch(`/api/yahoo?symbol=${encodeURIComponent(symbol)}&type=quote`);
+      if (quoteRes.ok) {
+        const quoteData = await quoteRes.json();
+        const q = quoteData.quoteResponse?.result?.[0] || quoteData.quote || {};
+        if (q.trailingPE || q.priceToBook || q.marketCap) {
+          stockData.name = q.shortName || q.longName || stockData.name;
+          stockData.sector = q.sector || q.industry || stockData.sector;
           stockData.fundamental = {
-            per: sd.trailingPE?.raw || sd.forwardPE?.raw || 0,
-            pbr: ks.priceToBook?.raw || 0,
-            roe: fd.returnOnEquity?.raw ? Math.round(fd.returnOnEquity.raw * 10000) / 100 : 0,
-            divYield: sd.dividendYield?.raw ? Math.round(sd.dividendYield.raw * 10000) / 100 : 0,
-            epsGrowth: ks.earningsQuarterlyGrowth?.raw ? Math.round(ks.earningsQuarterlyGrowth.raw * 10000) / 100 : 0,
-            revenueGrowth: fd.revenueGrowth?.raw ? Math.round(fd.revenueGrowth.raw * 10000) / 100 : 0,
-            marketCap: fd.marketCap?.fmt || sd.marketCap?.fmt || "",
+            per: q.trailingPE ? Math.round(q.trailingPE * 100) / 100 : (q.forwardPE ? Math.round(q.forwardPE * 100) / 100 : 0),
+            pbr: q.priceToBook ? Math.round(q.priceToBook * 100) / 100 : 0,
+            roe: q.returnOnEquity ? Math.round(q.returnOnEquity * 10000) / 100 : 0,
+            divYield: q.dividendYield ? Math.round(q.dividendYield * 100) / 100 : (q.trailingAnnualDividendYield ? Math.round(q.trailingAnnualDividendYield * 10000) / 100 : 0),
+            epsGrowth: q.earningsQuarterlyGrowth ? Math.round(q.earningsQuarterlyGrowth * 10000) / 100 : 0,
+            revenueGrowth: q.revenueGrowth ? Math.round(q.revenueGrowth * 10000) / 100 : 0,
+            marketCap: q.marketCap ? (q.marketCap >= 1e12 ? `${(q.marketCap / 1e12).toFixed(1)}T` : q.marketCap >= 1e9 ? `${(q.marketCap / 1e9).toFixed(1)}B` : q.marketCap >= 1e8 ? `${(q.marketCap / 1e8).toFixed(1)}億` : `${q.marketCap.toLocaleString()}`) : "",
           };
+        }
+      }
+
+      // quoteでROE/revenueGrowthが取れなかった場合、quoteSummaryも試す
+      if (stockData.fundamental.roe === 0 || stockData.fundamental.revenueGrowth === 0) {
+        const fundRes = await fetch(`/api/yahoo?symbol=${encodeURIComponent(symbol)}&type=quoteSummary`);
+        if (fundRes.ok) {
+          const fundData = await fundRes.json();
+          // quoteSummary形式
+          const r = fundData.quoteSummary?.result?.[0];
+          if (r) {
+            const ks = r.defaultKeyStatistics || {};
+            const fd = r.financialData || {};
+            const sd = r.summaryDetail || {};
+            const ap = r.assetProfile || {};
+            stockData.sector = stockData.sector || ap.sector || ap.industry || "";
+            if (stockData.fundamental.per === 0) stockData.fundamental.per = sd.trailingPE?.raw || sd.forwardPE?.raw || 0;
+            if (stockData.fundamental.pbr === 0) stockData.fundamental.pbr = ks.priceToBook?.raw || 0;
+            if (stockData.fundamental.roe === 0) stockData.fundamental.roe = fd.returnOnEquity?.raw ? Math.round(fd.returnOnEquity.raw * 10000) / 100 : 0;
+            if (stockData.fundamental.divYield === 0) stockData.fundamental.divYield = sd.dividendYield?.raw ? Math.round(sd.dividendYield.raw * 10000) / 100 : 0;
+            if (stockData.fundamental.epsGrowth === 0) stockData.fundamental.epsGrowth = ks.earningsQuarterlyGrowth?.raw ? Math.round(ks.earningsQuarterlyGrowth.raw * 10000) / 100 : 0;
+            if (stockData.fundamental.revenueGrowth === 0) stockData.fundamental.revenueGrowth = fd.revenueGrowth?.raw ? Math.round(fd.revenueGrowth.raw * 10000) / 100 : 0;
+            if (!stockData.fundamental.marketCap) stockData.fundamental.marketCap = fd.marketCap?.fmt || sd.marketCap?.fmt || "";
+          }
+          // quote_fallback形式（v10失敗→v6にフォールバックした場合）
+          const qf = fundData.quote;
+          if (qf && !r) {
+            if (stockData.fundamental.per === 0) stockData.fundamental.per = qf.trailingPE ? Math.round(qf.trailingPE * 100) / 100 : 0;
+            if (stockData.fundamental.pbr === 0) stockData.fundamental.pbr = qf.priceToBook ? Math.round(qf.priceToBook * 100) / 100 : 0;
+          }
         }
       }
     } catch (e) { /* ファンダメンタルは取れなくてもOK */ }
@@ -339,58 +367,125 @@ const BUILTIN_STOCKS = [
 ];
 
 // ============================================
-// マーケット指標データ
+// マーケット指標設定（Yahoo Financeシンボル）
 // ============================================
-const MARKET_INDICES = {
-  nikkei: { name: "日経平均株価", code: "NI225", value: 39420, change: +1.3, ytd: +8.5, high52w: 41200, low52w: 31500, currency: "¥" },
-  topix: { name: "TOPIX", code: "TPX", value: 2785, change: +0.9, ytd: +10.2, high52w: 2920, low52w: 2200, currency: "¥" },
-  sp500: { name: "S&P 500", code: "SPX", value: 6052, change: +0.7, ytd: +4.2, high52w: 6150, low52w: 4950, currency: "$" },
-  nasdaq: { name: "NASDAQ 100", code: "NDX", value: 21580, change: +1.2, ytd: +5.8, high52w: 22100, low52w: 17200, currency: "$" },
-  dow: { name: "ダウ平均", code: "DJI", value: 44250, change: +0.5, ytd: +3.1, high52w: 45100, low52w: 37800, currency: "$" },
+const MARKET_INDEX_CONFIG = {
+  nikkei: { name: "日経平均株価", symbol: "^N225", currency: "¥", region: "JP" },
+  topix: { name: "TOPIX", symbol: "^TPX", currency: "¥", region: "JP" },
+  sp500: { name: "S&P 500", symbol: "^GSPC", currency: "$", region: "US" },
+  nasdaq: { name: "NASDAQ 100", symbol: "^NDX", currency: "$", region: "US" },
+  dow: { name: "ダウ平均", symbol: "^DJI", currency: "$", region: "US" },
 };
 
-const MARKET_ANALYSIS = {
-  nikkei: {
-    summary: "日経平均は39,400円台で堅調に推移。米ハイテク株高と円安が追い風となり、半導体関連や自動車株を中心に買いが優勢。",
-    technical: "25日移動平均線（38,800円）を上回り、短期上昇トレンドを維持。RSI 62で過熱感はなく、上値余地あり。ボリンジャーバンド+1σ付近で推移しており、バンドウォークの可能性。",
-    drivers: "半導体関連（レーザーテック、東京エレクトロン）がセクター牽引。日銀の金融政策正常化への期待から銀行株も堅調。円安（154円台）が輸出企業の収益を押し上げ。",
-    outlook: "テクニカル的には40,000円の心理的節目が次のターゲット。下値は25日移動平均線の38,800円がサポート。米国の利下げ観測と半導体サイクル回復が中期的な追い風。リスク要因は急激な円高転換と米中関係の悪化。",
-    keyEvents: ["3/14 日銀金融政策決定会合", "3/19 FOMC結果発表", "3月末 配当権利確定日"],
-    sentiment: 72,
-  },
-  topix: {
-    summary: "TOPIXは2,785ポイントで年初来高値圏。バリュー株とグロース株のバランスが取れた上昇で、相場の厚みがある。",
-    technical: "200日移動平均線を大きく上回り、長期上昇トレンドが継続。NT倍率（日経/TOPIX）はやや低下傾向で、バリュー株への資金シフトが見られる。",
-    drivers: "銀行・保険などの金融セクターが牽引。商社株はバフェット効果の継続で海外投資家の買いが入りやすい。不動産セクターは金利上昇への警戒感から上値重い。",
-    outlook: "2,800ポイントの突破が焦点。海外投資家の買い越し基調が続けば、3,000ポイントへの道筋が見えてくる。PBR1倍割れの是正圧力が引き続き東証主導で進行中。",
-    keyEvents: ["3月中 東証のPBR改善要請進捗報告", "4月 新年度入り機関投資家のリバランス"],
-    sentiment: 68,
-  },
-  sp500: {
-    summary: "S&P 500は6,050台で史上最高値圏。AI関連投資の拡大期待とFRBの利下げ観測が相場を下支え。",
-    technical: "主要移動平均線をすべて上回る強い上昇トレンド。ただしRSI 68とやや過熱気味で、短期的な調整の可能性にも注意。出来高は平均を上回り、買い圧力は健在。",
-    drivers: "マグニフィセント7（Apple, Microsoft, NVIDIA等）が指数を牽引。AI設備投資の拡大でテクノロジーセクターが好調。ヘルスケア・公益は相対的にアンダーパフォーム。",
-    outlook: "6,000台の定着が焦点。企業決算は概ね好調で、EPS成長率はコンセンサス+10%前後。FRBの利下げペースが鍵。インフレの再加速がテールリスク。年末ターゲットは6,500〜6,800のレンジ。",
-    keyEvents: ["3/19 FOMC（金利据え置き予想）", "3月下旬 PCEデフレーター発表", "4月 Q1決算シーズン開始"],
-    sentiment: 70,
-  },
-  nasdaq: {
-    summary: "NASDAQ 100は21,500台で高値圏を維持。AI・半導体銘柄への資金流入が続き、テクノロジー主導の上昇。",
-    technical: "50日移動平均線からの乖離率が+5.8%とやや大きく、短期的な過熱リスクに注意。ただし、MACDは上昇シグナルを維持しており、トレンド自体は強い。",
-    drivers: "NVIDIAのデータセンター向け需要爆発、Microsoft/AmazonのAIインフラ投資拡大がセクター全体を押し上げ。半導体関連ETF（SOX）も高値更新。Apple Intelligenceの展開もポジティブ材料。",
-    outlook: "22,000ポイントが次のマイルストーン。AI投資テーマは2026年も継続見通し。リスクは金利上昇によるグロース株のバリュエーション圧縮と、AI投資の収益化への懐疑論台頭。",
-    keyEvents: ["3/5 NVIDIA GTC 2026", "3/19 FOMC", "4月 GAFAM決算集中"],
-    sentiment: 74,
-  },
-  dow: {
-    summary: "ダウ平均は44,250ドルで横ばい圏。ハイテク以外のオールドエコノミー銘柄の上値が重く、NASDAQに対してアンダーパフォーム。",
-    technical: "25日移動平均線と50日移動平均線が接近し、方向感が出にくい局面。RSI 52は中立圏で、上下どちらにも動きやすい。出来高は減少傾向で、投資家の様子見姿勢が鮮明。",
-    drivers: "UnitedHealth、Goldmanなど金融・ヘルスケアが堅調な一方、Boeing、Nikeなど個別銘柄の悪材料が指数の重し。ホームデポなど消費関連は景気減速懸念で上値重い。",
-    outlook: "45,000ドルの壁が意識される。構成銘柄の入替え（AI関連の追加）が進めば再評価の余地あり。景気のソフトランディング成功が前提条件。金利高止まりが長期化すれば、バリュエーション調整のリスク。",
-    keyEvents: ["3/7 雇用統計", "3/19 FOMC", "3月 個人消費支出データ"],
-    sentiment: 55,
-  },
-};
+// Yahoo Financeから指標データ取得
+async function fetchMarketIndex(symbol) {
+  try {
+    const res = await fetch(`/api/yahoo?symbol=${encodeURIComponent(symbol)}`);
+    if (!res.ok) return null;
+    const data = await res.json();
+    if (!data.chart?.result?.[0]) return null;
+    const result = data.chart.result[0];
+    const meta = result.meta;
+    const quotes = result.indicators.quote[0];
+    const closes = quotes.close.filter(c => c != null);
+    if (closes.length < 2) return null;
+
+    const price = meta.regularMarketPrice || closes[closes.length - 1];
+    const prevClose = meta.previousClose || meta.chartPreviousClose || closes[closes.length - 2];
+    const change = prevClose ? ((price - prevClose) / prevClose * 100) : 0;
+
+    // 移動平均
+    const calcMA = (arr, p) => arr.length >= p ? arr.slice(-p).reduce((a, b) => a + b, 0) / p : price;
+    const ma5 = calcMA(closes, 5);
+    const ma25 = calcMA(closes, 25);
+    const ma50 = calcMA(closes, 50);
+    const ma200 = closes.length >= 200 ? calcMA(closes, closes.length >= 200 ? 200 : closes.length) : calcMA(closes, closes.length);
+
+    // RSI
+    const calcRSI = (arr, period = 14) => {
+      if (arr.length < period + 1) return 50;
+      const changes = [];
+      for (let i = arr.length - period - 1; i < arr.length - 1; i++) changes.push(arr[i + 1] - arr[i]);
+      const gains = changes.filter(c => c > 0);
+      const losses = changes.filter(c => c < 0).map(c => Math.abs(c));
+      const avgGain = gains.length > 0 ? gains.reduce((a, b) => a + b, 0) / period : 0;
+      const avgLoss = losses.length > 0 ? losses.reduce((a, b) => a + b, 0) / period : 0;
+      if (avgLoss === 0) return 100;
+      return Math.round(100 - (100 / (1 + avgGain / avgLoss)));
+    };
+    const rsi = calcRSI(closes);
+
+    // 52週高安
+    const high52w = Math.max(...closes);
+    const low52w = Math.min(...closes);
+
+    // YTD（年初からのリターン）
+    const firstClose = closes[0];
+    const ytd = firstClose ? ((price - firstClose) / firstClose * 100) : 0;
+
+    // 直近5日間のトレンド
+    const last5 = closes.slice(-5);
+    const trend5d = last5.length >= 2 ? ((last5[last5.length - 1] - last5[0]) / last5[0] * 100) : 0;
+
+    return {
+      value: Math.round(price * 100) / 100,
+      change: Math.round(change * 100) / 100,
+      ytd: Math.round(ytd * 100) / 100,
+      high52w: Math.round(high52w * 100) / 100,
+      low52w: Math.round(low52w * 100) / 100,
+      rsi, ma5, ma25, ma50, ma200, trend5d: Math.round(trend5d * 100) / 100,
+      aboveMA25: price > ma25,
+      aboveMA50: price > ma50,
+      aboveMA200: price > ma200,
+      lastUpdated: new Date().toLocaleString("ja-JP"),
+    };
+  } catch (e) {
+    console.error("Market fetch error:", e);
+    return null;
+  }
+}
+
+// テクニカルデータから分析テキストを自動生成
+function generateMarketAnalysis(name, d, currency) {
+  if (!d) return null;
+  const priceStr = currency === "¥" ? `${d.value.toLocaleString()}円` : `${d.value.toLocaleString()}ドル`;
+  const ma25Str = currency === "¥" ? `${Math.round(d.ma25).toLocaleString()}円` : `${Math.round(d.ma25).toLocaleString()}`;
+  const ma50Str = currency === "¥" ? `${Math.round(d.ma50).toLocaleString()}円` : `${Math.round(d.ma50).toLocaleString()}`;
+
+  // センチメント算出
+  let sentiment = 50;
+  sentiment += d.change > 1 ? 8 : d.change > 0 ? 4 : d.change > -1 ? -4 : -8;
+  sentiment += d.rsi > 60 ? 5 : d.rsi < 40 ? -5 : 0;
+  sentiment += d.aboveMA25 ? 5 : -5;
+  sentiment += d.aboveMA50 ? 5 : -5;
+  sentiment += d.aboveMA200 ? 5 : -3;
+  sentiment += d.trend5d > 1 ? 5 : d.trend5d < -1 ? -5 : 0;
+  sentiment += d.ytd > 5 ? 3 : d.ytd < -5 ? -3 : 0;
+  sentiment = Math.max(15, Math.min(90, sentiment));
+
+  // サマリー
+  const changeDir = d.change >= 0 ? "上昇" : "下落";
+  const trendLabel = d.trend5d > 0.5 ? "上昇基調" : d.trend5d < -0.5 ? "下落基調" : "横ばい";
+  const summary = `${name}は${priceStr}で${changeDir}（前日比${d.change >= 0 ? "+" : ""}${d.change}%）。直近5日間は${trendLabel}で、年初来${d.ytd >= 0 ? "+" : ""}${d.ytd}%のリターン。`;
+
+  // テクニカル
+  const rsiState = d.rsi > 70 ? `RSI ${d.rsi}は買われすぎ水準で短期的な調整リスクに注意` : d.rsi < 30 ? `RSI ${d.rsi}は売られすぎ水準で反発余地あり` : d.rsi > 55 ? `RSI ${d.rsi}はやや強気圏で上値余地を示唆` : d.rsi < 45 ? `RSI ${d.rsi}はやや弱気圏で下押し圧力が残る` : `RSI ${d.rsi}は中立圏で方向感に乏しい`;
+  const maState = d.aboveMA25 && d.aboveMA50 ? `25日線（${ma25Str}）・50日線（${ma50Str}）をともに上回り、短中期トレンドは上向き` : d.aboveMA25 ? `25日線（${ma25Str}）を上回るが50日線（${ma50Str}）付近で攻防中` : `25日線（${ma25Str}）を下回り、短期的な弱気シグナル`;
+  const technical = `${rsiState}。${maState}。${d.aboveMA200 ? "200日移動平均線上で長期上昇トレンドを維持。" : "200日移動平均線を下回り、長期トレンドに黄色信号。"}`;
+
+  // 注目材料
+  const ma25Dev = ((d.value - d.ma25) / d.ma25 * 100).toFixed(1);
+  const drivers = `25日移動平均線からの乖離率は${ma25Dev}%。${d.rsi > 65 ? "過熱感があるため短期的な利益確定売りに注意。" : d.rsi < 35 ? "売られすぎ感があり、反発狙いのエントリーポイントを模索する局面。" : "方向感を見極める局面で、出来高やニュースフローに注目。"}52週レンジでは${Math.round((d.value - d.low52w) / (d.high52w - d.low52w) * 100)}%の位置。`;
+
+  // 見通し
+  const outlook = d.change > 0 && d.aboveMA25
+    ? `テクニカル的には堅調で、${d.aboveMA50 ? "中期的な上昇トレンド継続" : "50日線の突破が次のターゲット"}。${d.rsi > 70 ? "ただしRSIの過熱感から短期調整の可能性も。" : "上値追いに期待が持てる展開。"}`
+    : d.change < 0 && !d.aboveMA25
+    ? `25日線を割り込み弱含み。${d.aboveMA200 ? "200日線がサポートとして機能するかが焦点。" : "長期トレンドの転換リスクに警戒。"}${d.rsi < 35 ? "ただしRSIの売られすぎから反発の可能性も。" : "戻り売り圧力に注意。"}`
+    : `方向感は中立的。${d.aboveMA50 ? "50日線がサポートとして機能しており、基調は維持。" : "50日線の回復がポイント。"}明確なシグナル待ちの展開。`;
+
+  return { summary, technical, drivers, outlook, sentiment, lastUpdated: d.lastUpdated };
+}
 
 // ============================================
 // AI分析エンジン
@@ -633,10 +728,24 @@ export default function App() {
   const [searchError, setSearchError] = useState("");
   const [favListOpen, setFavListOpen] = useState(false);
   const [marketExpanded, setMarketExpanded] = useState(new Set(["nikkei"]));
+  const [marketData, setMarketData] = useState({});
+  const [marketLoading, setMarketLoading] = useState(false);
 
   const toggleFav = (code) => setFavorites(prev => { const n = new Set(prev); if (n.has(code)) n.delete(code); else n.add(code); return n; });
   const toggleExpand = (code) => setExpandedCards(prev => { const n = new Set(prev); if (n.has(code)) n.delete(code); else n.add(code); return n; });
   const toggleMarketExpand = (key) => setMarketExpanded(prev => { const n = new Set(prev); if (n.has(key)) n.delete(key); else n.add(key); return n; });
+
+  // マーケットデータ取得
+  const fetchAllMarketData = useCallback(async () => {
+    setMarketLoading(true);
+    const results = {};
+    for (const [key, cfg] of Object.entries(MARKET_INDEX_CONFIG)) {
+      const d = await fetchMarketIndex(cfg.symbol);
+      if (d) results[key] = d;
+    }
+    setMarketData(results);
+    setMarketLoading(false);
+  }, []);
 
   const favStocks = useMemo(() => allStocks.filter(s => favorites.has(s.code)), [allStocks, favorites]);
   const analyses = useMemo(() => { const m = {}; favStocks.forEach(s => { m[s.code] = analyzeStock(s); }); return m; }, [favStocks]);
@@ -882,34 +991,54 @@ export default function App() {
       {/* ===== マーケットタブ ===== */}
       {activeTab === "market" && (
         <div style={{ padding: "12px 12px 100px" }}>
+          {/* 更新ボタン */}
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 12 }}>
+            <span style={{ fontSize: 11, color: "#475569" }}>
+              {marketData.nikkei?.lastUpdated ? `最終更新: ${marketData.nikkei.lastUpdated}` : "データ未取得"}
+            </span>
+            <button onClick={fetchAllMarketData} disabled={marketLoading} style={{
+              padding: "6px 14px", borderRadius: 8, border: "1px solid rgba(56,189,248,0.3)",
+              background: marketLoading ? "rgba(56,189,248,0.1)" : "rgba(56,189,248,0.15)",
+              color: "#38bdf8", fontSize: 11, fontWeight: 700, cursor: marketLoading ? "wait" : "pointer",
+            }}>{marketLoading ? "取得中..." : "🔄 最新データを取得"}</button>
+          </div>
+
           {/* 指標サマリー */}
           <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8, marginBottom: 14 }}>
-            {Object.entries(MARKET_INDICES).map(([key, idx]) => (
-              <div key={key} onClick={() => toggleMarketExpand(key)} style={{
-                background: marketExpanded.has(key) ? "rgba(56,189,248,0.06)" : "rgba(16,22,40,0.8)",
-                borderRadius: 12, padding: "14px 16px", cursor: "pointer",
-                border: `1px solid ${marketExpanded.has(key) ? "rgba(56,189,248,0.2)" : "rgba(148,163,184,0.06)"}`,
-                transition: "all 0.2s",
-              }}>
-                <div style={{ fontSize: 10, color: "#475569", marginBottom: 2 }}>{idx.name}</div>
-                <div style={{ fontSize: 18, fontWeight: 900, color: "#f1f5f9", fontVariantNumeric: "tabular-nums" }}>
-                  {idx.value.toLocaleString()}
+            {Object.entries(MARKET_INDEX_CONFIG).map(([key, cfg]) => {
+              const d = marketData[key];
+              return (
+                <div key={key} onClick={() => toggleMarketExpand(key)} style={{
+                  background: marketExpanded.has(key) ? "rgba(56,189,248,0.06)" : "rgba(16,22,40,0.8)",
+                  borderRadius: 12, padding: "14px 16px", cursor: "pointer",
+                  border: `1px solid ${marketExpanded.has(key) ? "rgba(56,189,248,0.2)" : "rgba(148,163,184,0.06)"}`,
+                  transition: "all 0.2s",
+                }}>
+                  <div style={{ fontSize: 10, color: "#475569", marginBottom: 2 }}>{cfg.name}</div>
+                  <div style={{ fontSize: 18, fontWeight: 900, color: "#f1f5f9", fontVariantNumeric: "tabular-nums" }}>
+                    {d ? d.value.toLocaleString() : "---"}
+                  </div>
+                  {d ? (
+                    <div style={{ display: "flex", gap: 8, marginTop: 4 }}>
+                      <span style={{ fontSize: 11, fontWeight: 700, color: d.change >= 0 ? "#4ade80" : "#f87171" }}>
+                        {d.change >= 0 ? "+" : ""}{d.change}%
+                      </span>
+                      <span style={{ fontSize: 10, color: "#64748b" }}>
+                        YTD {d.ytd >= 0 ? "+" : ""}{d.ytd}%
+                      </span>
+                    </div>
+                  ) : (
+                    <div style={{ fontSize: 11, color: "#475569", marginTop: 4 }}>🔄ボタンで取得</div>
+                  )}
                 </div>
-                <div style={{ display: "flex", gap: 8, marginTop: 4 }}>
-                  <span style={{ fontSize: 11, fontWeight: 700, color: idx.change >= 0 ? "#4ade80" : "#f87171" }}>
-                    {idx.change >= 0 ? "+" : ""}{idx.change}%
-                  </span>
-                  <span style={{ fontSize: 10, color: "#64748b" }}>
-                    YTD {idx.ytd >= 0 ? "+" : ""}{idx.ytd}%
-                  </span>
-                </div>
-              </div>
-            ))}
+              );
+            })}
           </div>
 
           {/* 詳細分析 */}
-          {Object.entries(MARKET_INDICES).map(([key, idx]) => {
-            const ma = MARKET_ANALYSIS[key];
+          {Object.entries(MARKET_INDEX_CONFIG).map(([key, cfg]) => {
+            const d = marketData[key];
+            const ma = d ? generateMarketAnalysis(cfg.name, d, cfg.currency) : null;
             if (!ma || !marketExpanded.has(key)) return null;
             const sentColor = ma.sentiment >= 65 ? "#22c55e" : ma.sentiment >= 50 ? "#4ade80" : ma.sentiment >= 40 ? "#eab308" : "#ef4444";
             const sentLabel = ma.sentiment >= 65 ? "強気" : ma.sentiment >= 50 ? "やや強気" : ma.sentiment >= 40 ? "やや弱気" : "弱気";
@@ -919,8 +1048,11 @@ export default function App() {
                 <div style={{ padding: "18px 18px 0" }}>
                   <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 12 }}>
                     <div>
-                      <div style={{ fontSize: 16, fontWeight: 900, color: "#f1f5f9" }}>{idx.name}</div>
-                      <div style={{ fontSize: 11, color: "#64748b" }}>52週: {idx.low52w.toLocaleString()} 〜 {idx.high52w.toLocaleString()}</div>
+                      <div style={{ fontSize: 16, fontWeight: 900, color: "#f1f5f9" }}>{cfg.name}</div>
+                      <div style={{ fontSize: 11, color: "#64748b" }}>
+                        52週: {d.low52w.toLocaleString()} 〜 {d.high52w.toLocaleString()}
+                        <span style={{ marginLeft: 8, fontSize: 10 }}>RSI: {d.rsi}</span>
+                      </div>
                     </div>
                     <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
                       <div style={{ width: 40, height: 6, borderRadius: 3, background: "rgba(148,163,184,0.1)", overflow: "hidden" }}>
@@ -928,6 +1060,19 @@ export default function App() {
                       </div>
                       <span style={{ fontSize: 11, fontWeight: 700, color: sentColor }}>{sentLabel} {ma.sentiment}%</span>
                     </div>
+                  </div>
+                  {/* テクニカル指標バー */}
+                  <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 6, marginBottom: 12 }}>
+                    {[
+                      { label: "MA25", above: d.aboveMA25 },
+                      { label: "MA50", above: d.aboveMA50 },
+                      { label: "MA200", above: d.aboveMA200 },
+                    ].map(m => (
+                      <div key={m.label} style={{ textAlign: "center", padding: "4px 0", borderRadius: 6, background: m.above ? "rgba(34,197,94,0.1)" : "rgba(239,68,68,0.1)", border: `1px solid ${m.above ? "rgba(34,197,94,0.2)" : "rgba(239,68,68,0.2)"}` }}>
+                        <div style={{ fontSize: 9, color: "#64748b" }}>{m.label}</div>
+                        <div style={{ fontSize: 10, fontWeight: 700, color: m.above ? "#4ade80" : "#f87171" }}>{m.above ? "▲ 上" : "▼ 下"}</div>
+                      </div>
+                    ))}
                   </div>
                 </div>
 
@@ -945,28 +1090,24 @@ export default function App() {
                     </div>
                   </div>
                 ))}
-
-                {/* 注目イベント */}
-                <div style={{ padding: "0 18px 18px" }}>
-                  <div style={{ fontSize: 11, fontWeight: 700, color: "#475569", marginBottom: 6 }}>📅 注目イベント</div>
-                  <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
-                    {ma.keyEvents.map((ev, i) => (
-                      <span key={i} style={{
-                        padding: "5px 12px", borderRadius: 8, fontSize: 11, fontWeight: 600,
-                        background: "rgba(56,189,248,0.08)", border: "1px solid rgba(56,189,248,0.15)",
-                        color: "#7dd3fc",
-                      }}>{ev}</span>
-                    ))}
-                  </div>
-                </div>
+                <div style={{ padding: "0 18px 14px", fontSize: 10, color: "#374151" }}>更新: {ma.lastUpdated}</div>
               </div>
             );
           })}
 
+          {/* 未取得時のガイド */}
+          {Object.keys(marketData).length === 0 && !marketLoading && (
+            <div style={{ textAlign: "center", padding: 40, color: "#475569" }}>
+              <div style={{ fontSize: 32, marginBottom: 12 }}>📊</div>
+              <div style={{ fontSize: 13 }}>「🔄 最新データを取得」ボタンを押して</div>
+              <div style={{ fontSize: 13 }}>リアルタイムの市場データと分析を表示</div>
+            </div>
+          )}
+
           {/* 免責 */}
           <div style={{ padding: "14px 16px", borderRadius: 12, background: "rgba(16,22,40,0.5)", border: "1px solid rgba(148,163,184,0.04)" }}>
             <p style={{ fontSize: 10, color: "#374151", margin: 0, lineHeight: 1.7 }}>
-              ⚠️ 本レポートはサンプルデータに基づくデモです。実際の投資判断はご自身の責任で行ってください。
+              ⚠️ 本レポートはYahoo Financeのデータに基づくテクニカル分析です。投資判断はご自身の責任で行ってください。
             </p>
           </div>
         </div>
